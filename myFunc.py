@@ -12,6 +12,7 @@ import xgboost as xgb
 from xgboost import XGBClassifier
 import shap
 from scipy import stats
+from scipy.special import expit
 import statsmodels.nonparametric.api as smnp
 from glmnet import LogitNet
 from sklearn.model_selection import cross_val_score, train_test_split, GridSearchCV, StratifiedKFold
@@ -22,7 +23,6 @@ import seaborn as sns
 sns.set_style("ticks")
 import warnings
 warnings.simplefilter("ignore")
-import pickle
 
 
 # Pandas options
@@ -236,7 +236,20 @@ def _df_glmnet_coeff_path(model, df):
         
     return pd.DataFrame(data = dct.items() , columns = ["Features", "Coeffs"]).sort_values(by = "Coeffs", ascending = False).reset_index(drop = True)
     
-    
+# --------------------------------------------------------------------------------------
+def _df_A_glmnet_raw_coeff_path(model, df):
+    """
+    Function to build a dataframe for nonzero raw coeff based on the adaptive glmnet
+    ---------------------
+    Parameters:
+               - model : a fitted glmnet object
+               - df: in case that the input is the pandas dataframe, the column names of the coeff. will appear as a legend
+                   
+    """
+    idx = list(np.nonzero(np.reshape(model.coef_/model.scales, (1,-1)))[1])
+    dct = dict(zip([df.columns.tolist()[i] for i in idx], [(model.coef_/model.scales)[0][i] for i in idx]))
+        
+    return pd.DataFrame(data = dct.items() , columns = ["Features", "Coeffs"]).sort_values(by = "Coeffs", ascending = False).reset_index(drop = True)
 # --------------------------------------------------------------------------------------
 
 def _plot_roc_nfolds_glmnet(X_, Y,
@@ -886,6 +899,7 @@ def _slick_feature_selector(X, Y, n_iter = 1,
             
             print(myColor.BOLD + "*-*-*-*-*-*-*-*- " + myColor.RED + F"Memory Got Explicitly Free -- Fold = {ijk}/{nfold}" + myColor.END + myColor.BOLD +" -*-*-*-*-*-*-*-*")
             ijk += 1
+            gc.collect()
             
         print(myColor.BOLD + "*-*-*-*-*-*-*-*- " + myColor.DARKCYAN + F"Iteration {iteration + 1}" + myColor.END + myColor.BOLD + " -*-*-*-*-*-*-*-*")
         print(myColor.BOLD + "*-*- " + myColor.GREEN+ F"Internal-{nfold} Folds-CV-Train = {np.mean(int_cv_train2):.3f} +/- {np.std(int_cv_train2):.3f}" + myColor.END + myColor.BOLD + " -*-*- " + myColor.GREEN + F"Internal-{nfold} Folds-CV-Test = {np.mean(int_cv_test2):.3f} +/- {np.std(int_cv_test2):.3f}"+ myColor.END + myColor.BOLD +" -*-*")
@@ -893,6 +907,7 @@ def _slick_feature_selector(X, Y, n_iter = 1,
         
         # free memory here at iteration
         del int_cv_train2, int_cv_test2, ext_cv_train2, ext_cv_test2, X_permuted, cols, Xval, cv
+        gc.collect()
 
         
     # putting together the outputs in one dict
@@ -980,11 +995,11 @@ def _plot_slick_outputs(outputs, df_features):
 
 # --------------------------------------------------------------------------------------    
 
-def _bst_shap(X, Y, num_boost_round = 1000,
+def _bst_shap(X_, Y, num_boost_round = 1000,
                                     nfold = 10,
                                     stratified = True,
                                     sparse_matrix = False,
-                                    scale_data = False,
+                                    scale_X = False,
                                     metrics = ("auc"),
                                     early_stopping_rounds = 20,
                                     seed = 1367,
@@ -1001,7 +1016,7 @@ def _bst_shap(X, Y, num_boost_round = 1000,
                - num_boost_rounds: max number of boosting rounds, (default = 1000)
                - stratified: stratificaiton of the targets (default = True)
                - sparse_matrix: converting pandas dataframe to sparse matrix (default = False)
-               - scale_data: Flag to run scale preprocessing module to have a mean of zero and unit variance. It would change the data to non-sparse format. (default = False)
+               - scale_X: Flag to run scale preprocessing module to have a mean of zero and unit variance. It would change the data to non-sparse format. (default = False)
                - metrics: classification/regression metrics (default = ("auc"))
                -          Full list at https://xgboost.readthedocs.io/en/latest/parameter.html
                - early_stopping_rounds: the criteria for stopping if the test metric is not improved (default = 20)
@@ -1032,11 +1047,13 @@ def _bst_shap(X, Y, num_boost_round = 1000,
             cv_results: a dataframe contains the cv-results (train/test + std of train/test) for metric
     """
     # Defining the data + scaling
-    if scale_data == True:
-        if isinstance(X, pd.DataFrame):
-            X = pd.DataFrame(scale(X), columns = X.columns.tolist())
+    if scale_X == True:
+        if isinstance(X_, pd.DataFrame):
+            X = pd.DataFrame(scale(X_), columns = X_.columns.tolist())
         else:
-            X = scale(X)
+            X = scale(X_)
+    else:
+        X = X_
 
     # sparse matrix flag
     if(sparse_matrix == True):
@@ -1103,7 +1120,7 @@ def _bst_shap(X, Y, num_boost_round = 1000,
 
 # --------------------------------------------------------------------------------------
 
-def _A_glmnet(X_, Y, alpha = 0.5, n_splits = 10, alpha_ini = 0.0, penalty_gamma = 2, random_state = 1367):
+def _A_glmnet(X_, Y, alpha = 0.5, n_splits = 10, alpha_ini = 0.0, penalty_gamma = 2, random_state = 1367, scale_X = True):
     """
     Function to return a trained adaptive glmnet model
     ---------------------------------
@@ -1114,15 +1131,19 @@ def _A_glmnet(X_, Y, alpha = 0.5, n_splits = 10, alpha_ini = 0.0, penalty_gamma 
                - n_splits : number of folds CV for finding penalty parameters lambda (default = 10)
                - alpha_ini : (default = 0.0)
                - penalty_gamma : gamma penalty value which can be lower for more features to keep (default = 2.0)
-               - random_state: Random state seed (default = 1367).
+               - random_state: Random state seed (default = 1367)
+               - scale_X: flag for scaling the feautures (default = True)
               
               
     """
-    # Defining the data + scaling
-    if isinstance(X_, pd.DataFrame):
-        X = pd.DataFrame(scale(X_), columns = X_.columns.tolist())
+    if scale_X == True:
+        # Defining the data + scaling
+        if isinstance(X_, pd.DataFrame):
+            X = pd.DataFrame(scale(X_), columns = X_.columns.tolist())
+        else:
+            X = scale(X_)
     else:
-        X = scale(X_)
+        X = X_
         
     def get_stratified_cv_test_indices(y, n_splits = n_splits, random_state = random_state):
         """ Returns an array containing a test fold id for each sample
@@ -1144,7 +1165,7 @@ def _A_glmnet(X_, Y, alpha = 0.5, n_splits = 10, alpha_ini = 0.0, penalty_gamma 
     return a
 
 # --------------------------------------------------------------------------------------
-def _stable_alpha_glmnet(X_, Y, alpha_list = None, n_splits = 10, alpha_ini = 0.0, penalty_gamma = 2):
+def _stable_alpha_glmnet(X_, Y, alpha_list = None, n_splits = 10, alpha_ini = 0.0, penalty_gamma = 2, scale_X = True):
     """
     Function to find the stable alpha for adaptive glmnet
     ---------------------
@@ -1155,14 +1176,17 @@ def _stable_alpha_glmnet(X_, Y, alpha_list = None, n_splits = 10, alpha_ini = 0.
                - n_splits: number of folds for cross-validation (default = 10)
                - alpha_ini: initialization point for alpha (default = 0.0)
                - penalty_gamma: penalizing factor for gamma (default = 2)
-               - 
+               - scale_X: flag for scaling the feautures (default = True)
     
     """
-    # Defining the data + scaling
-    if isinstance(X_, pd.DataFrame):
-        X = pd.DataFrame(scale(X_), columns = X_.columns.tolist())
+    if scale_X == True:
+        # Defining the data + scaling
+        if isinstance(X_, pd.DataFrame):
+            X = pd.DataFrame(scale(X_), columns = X_.columns.tolist())
+        else:
+            X = scale(X_)
     else:
-        X = scale(X_)
+        X = X_
         
     def logitnet_nonzero_coef(g):
         idx = np.where(g.coef_[0] != 0)[0]
@@ -1206,7 +1230,7 @@ def _stable_alpha_glmnet(X_, Y, alpha_list = None, n_splits = 10, alpha_ini = 0.
     plt.show()
 # --------------------------------------------------------------------------------------
 
-def _S_glmnet(X_, Y, alpha = 0.5, n_splits = 10, scoring = "roc_auc"):
+def _S_glmnet(X_, Y, alpha = 0.5, n_splits = 10, scoring = "roc_auc", scale_X = True):
     """
     Function for standard glmnet
     -------------------------
@@ -1219,11 +1243,14 @@ def _S_glmnet(X_, Y, alpha = 0.5, n_splits = 10, scoring = "roc_auc"):
     output: trained glmnet model 
 
     """
-    # Defining the data + scaling
-    if isinstance(X_, pd.DataFrame):
-        X = pd.DataFrame(scale(X_), columns = X_.columns.tolist())
+    if scale_X == True:
+        # Defining the data + scaling
+        if isinstance(X_, pd.DataFrame):
+            X = pd.DataFrame(scale(X_), columns = X_.columns.tolist())
+        else:
+            X = scale(X_)
     else:
-        X = scale(X_)
+        X = X_
         
     from glmnet import LogitNet  
     model = LogitNet(alpha = alpha,
@@ -1690,7 +1717,8 @@ def _plot_pr_nfolds_xgboost(X_, Y,
 
 def _binary_classification_metrics(y_true, y_pred_proba, threshold = 0.5, average_method = "weighted", precision_digits = 3):
     """
-    Function to display all possible classificaiton metrics
+    Function to display all possible classificaiton metrics.
+    NOTE: All thresholds are applied with ">" not ">="
     --------------------------
     Parameters:
                - y_true: list of true values [0, 1]
@@ -1773,9 +1801,10 @@ def _binary_classification_metrics(y_true, y_pred_proba, threshold = 0.5, averag
 
 # --------------------------------------------------------------------------------------
 
-def _binary_classification_metrics_comparison(model, X_, y_true, average_methods = ["weighted", "binary", "micro", "macro"]):
+def _binary_classification_metrics_comparison(model, X_, y_true, scale_X=False, average_methods = ["weighted", "binary", "micro", "macro"]):
     """
     Function to find the optimal threshold for binary classification
+    NOTE: All thresholds are applied with ">" not ">="
     ----------------------------
     Parameters:
                - model: a trained model object (such as xgboost, glmnet, ...)
@@ -1787,10 +1816,13 @@ def _binary_classification_metrics_comparison(model, X_, y_true, average_methods
     from IPython.core.display import display, HTML
 
     # Defining the data + scaling
-    if isinstance(X_, pd.DataFrame):
-        X = scale(X_.values)
+    if scale_X:
+        if isinstance(X_, pd.DataFrame):
+            X = scale(X_.values)
+        else:
+            X = scale(X_)
     else:
-        X = scale(X_)
+        X = X_
         
     class_names = [0, 1]
     
@@ -2210,7 +2242,7 @@ def _plot_calibration_curve(model, X, y_true, normalize = False, n_bins = 10, st
     if return_model:
         return clf
 # --------------------------------------------------------------------------------------     
-def _train_test_split(X, y, test_size=0.20, shuffle=True, scale = True, random_state=1367):
+def _train_test_split(X, y, test_size=0.20, shuffle=True, scale = True, with_mean=True, with_std=True, random_state=1367):
     """
     Function to build stratified train/test sets with scale flag
     ---------------------
@@ -2220,13 +2252,15 @@ def _train_test_split(X, y, test_size=0.20, shuffle=True, scale = True, random_s
                - test_size: Test size in float (deafult = 0.20)
                - shuffle: Shuffle flag (default = True)
                - scale: Scale flag to fit on train set and transform it on the test set (default = True)
+               - with_mean: Flag to remove the mean from the feature to have 0 mean (default = True)
+               - with_std: Scale the feature to have unit variance (default = True)
                - random_state: Random state (default = 1367)
     """
     if scale == True:
         if isinstance(X, pd.DataFrame):
             cols = X.columns.tolist()
             Xtr, Xte, y_train, y_test = train_test_split(X, y, test_size=test_size, random_state=random_state, shuffle=shuffle, stratify=y)
-            _scaler = StandardScaler(with_mean=True, with_std=True)
+            _scaler = StandardScaler(with_mean=with_mean, with_std=with_std)
             SXtr = _scaler.fit_transform(Xtr)
             SXte = _scaler.transform(Xte)
             X_train = pd.DataFrame(data=SXtr, columns=cols)
@@ -2234,7 +2268,7 @@ def _train_test_split(X, y, test_size=0.20, shuffle=True, scale = True, random_s
             return X_train, X_test, y_train, y_test
         else:
             Xtr, Xte, y_train, y_test = train_test_split(X, y, test_size=test_size, random_state=random_state, shuffle=shuffle, stratify=y)
-            _scaler = StandardScaler(with_mean=True, with_std=True)
+            _scaler = StandardScaler(with_mean=with_mean, with_std=with_std)
             X_train = _scaler.fit_transform(Xtr)
             X_test = _scaler.transform(Xte)
             return X_train, X_test, y_train, y_test
@@ -2509,4 +2543,328 @@ def _cond_plot(df, x, y=["re", "re6m"], agg_func='mean',
         ax.set_xlabel(xlabel)
     ax.set_ylabel(ylabel)
     ax.legend(loc='best', fancybox=True, framealpha=0.3)
-    return ax           
+    return ax
+
+# --------------------------------------------------------------------------------------   
+def _glmnet_validation(X, Y, alpha=0.5, n_splits=10, alpha_ini=0.0, penalty_gamma=2.0, random_state=1367, shuffle=True, precision_digits=3, with_mean=False, with_std=False, figsize=(8, 8), color="slateblue", output_features=False):
+    """
+    Function to validate adaptive glmnet models with nfolds internal/external cross-validation
+    ---------------------
+    Parameters:
+               - X: Features matrix in Pandas DataFrame format
+               - Y: Targets in numpy array/list format
+               - alpha: Stability Parameter (default=0.5)
+               - n_splits: Number of folds for cross-validation (default=10)
+               - alpha_ini : Stability parameter initial point (default = 0.0)
+               - penalty_gamma : Gamma penalty value which can be lower for more features to keep (default = 2.0)
+               - random_state: Random state seed (default = 1367)
+               - shuffle: Flag to shuffle the data
+               - precision_digits: Number of floating point digits (default=3)
+               - figsize: Figure size (default=(8,8))
+               - color: Color for bar chart (default="cyan")
+               - output_features: Flag to output features frequency across nfolds cross validation (default=False)
+    """
+    
+    
+    X.reset_index(drop=True, inplace=True)
+    # main loop
+    fold = 1
+    frames = []
+    pruned_features = []
+    cols = X.columns.tolist()
+    cv = StratifiedKFold(n_splits=n_splits, shuffle=shuffle, random_state=random_state)
+    for train_index, test_index in cv.split(X, Y):
+        _scaler = StandardScaler(with_mean=with_mean, with_std=with_std)
+        X_train = pd.DataFrame(data = _scaler.fit_transform(X.values[train_index]), columns = cols)
+        X_test = pd.DataFrame(data = _scaler.transform(X.values[test_index]), columns = cols)
+        Y_train = Y[train_index]
+        Y_test = Y[test_index]
+        model = _A_glmnet(X_train, Y_train, alpha=alpha, n_splits=n_splits, alpha_ini=alpha_ini, penalty_gamma=penalty_gamma, random_state=random_state, scale_X=False)
+        auc_test = roc_auc_score(y_true = Y_test, y_score = model.predict_proba(X_test)[:, 1]) 
+        
+        
+        performance = {"Train-Mean-AUC" : round(np.mean(model.cv_mean_score_), precision_digits),
+                       "Train-Std-AUC" : round(np.std(model.cv_mean_score_), precision_digits),
+                       "Train-Median-AUC" : round(np.median(model.cv_mean_score_), precision_digits),
+                       "Test-AUC" : round(auc_test, precision_digits),
+                       "Nonzero Coeff." : np.count_nonzero(model.coef_)
+                      }
+        df_show = pd.DataFrame(data = performance, index = [F"""Fold = {fold}"""])
+        frames.append(df_show)
+        for col in _df_glmnet_coeff_path(model, X_train)["Features"].values.tolist():
+            pruned_features.append(col)
+        fold += 1
+        del train_index, test_index, _scaler, X_train, X_test, Y_train, Y_test, model, auc_test, performance, df_show
+    
+    
+    df_to_show = pd.concat(frames)
+    # Set CSS properties
+    th_props = [("font-size", "12px"),
+                ("text-align", "center"),
+                ("font-weight", "bold")]
+
+    td_props = [("font-size", "12px")]
+
+    # Set table styles
+    styles = [dict(selector = "th", props = th_props),
+              dict(selector = "td", props = td_props)]
+    cm = sns.light_palette("blue", as_cmap = True)
+    display(df_to_show.style.background_gradient(cmap = cm) \
+                            .highlight_max(color = "fuchsia") \
+                             .set_table_styles(styles))    
+    unique_elements, counts_elements = np.unique(pruned_features, return_counts=True)
+    counts_elements = [float(i) for i in list(counts_elements)]
+    df_features = pd.DataFrame(data = {"Feature" : list(unique_elements) , "Count" : counts_elements})
+    df_features.sort_values(by = ["Count"], ascending = False, inplace = True)
+    # Plotting
+    import matplotlib as mpl
+    mpl.rcParams["axes.linewidth"] = 3 
+    mpl.rcParams["lines.linewidth"] = 7
+    plt.figure()
+    df_features.sort_values(by = ["Count"]).plot.barh(x ="Feature", y="Count", color=color, figsize=figsize)
+    plt.show()
+    
+    if output_features==True:
+        return df_features
+    
+# --------------------------------------------------------------------------------------   
+        
+def _plot_threat_score_vs_threshold(model, X, y_true, num_thresholds=100, output=False):
+    """
+    Function to plot threat score vs different threshold at return the maximum
+    ----------------------------
+    Parameters:
+               -model: Trained model
+               -X: Feature Set
+               -y_true: targets
+               -num_thresholds: Number of points as thresholds (default=100)
+               -output: Flag to return the best threshold to maximize the threat score
+    """
+    def __calculate_threat_score(tp, fp, fn):
+        """
+        Helper function to calculate threat score based on confusion matrix in each iteration
+        """
+        return tp/(tp+fp+fn)
+    
+    # main loop
+    thresholds = np.linspace(0.0, 1.0, num_thresholds)
+    ts = []
+    for th in thresholds:
+        y_pred_proba = model.predict_proba(X)[:, 1]
+        y_pred = (y_pred_proba > th).astype(int)
+        tn, fp, fn, tp = confusion_matrix(y_true = y_true, y_pred = y_pred).ravel()
+        ts.append(__calculate_threat_score(tp, fp, fn))
+    
+    # plotting    
+    import matplotlib as mpl
+    import seaborn as sns
+    sns.set_style("ticks")
+    mpl.rcParams['axes.linewidth'] = 3 
+    mpl.rcParams['lines.linewidth'] = 2
+    
+    plt.figure(figsize=(10,6))
+    plt.plot(thresholds, ts, ls="-", marker="o", ms=8, color="cyan")
+    
+    plt.axvline(thresholds[np.argmax(ts)], color="navy", ls = "--", label=F"Threshold = {thresholds[np.argmax(ts)]:.3f}\nThreat Score = {ts[np.argmax(ts)]:.3f}")
+    plt.legend(prop={'size':12} , loc = 0)
+    plt.xlim([-0.01, 1.01])
+    plt.tick_params(axis='both', which='major', labelsize=12)
+    plt.xlabel("Threshold", fontsize = 15)
+    plt.ylabel("Threat Score", fontsize = 15)
+    plt.show()
+    
+    if output:
+        return thresholds[np.argmax(ts)]
+    
+# -------------------------------------------------------------------------------------- 
+
+def _iqr_clipper(df, low=0.25, high=0.75, factor=1.5, exclude=None):
+    """
+    Function to clip continuous features based on their interquantile range
+    ------------------------------
+    Parameters:
+              -df: Pandas DataFrame
+              -low: Lower bound of IQR (default=0.25)
+              -high: Upper bound of IQR (default=0.75)
+              -factor: IQR factor (default=1.5)
+              -exclude: List of columns (i.e. ["col1", "col2", "col3"]) to be excluded from IQR clipping (default=None)
+    ------------------------------    
+    IQR Algorithm:
+    Q1 = 0.25 Quantile
+    Q3 = 0.75 Quantile
+    IQR = Q3 - Q1
+    Low = Q1 - 1.5 * IQR
+    High = Q3 + 1.5 * IQR
+    """
+    
+    # finding continouos/binary columns
+    bin_cols = _binary_col_finder(df)
+    cont_cols = _continuous_col_finder(df)
+    
+    # checkpoint for any exclusion
+    if exclude == None:
+        df_cont = df.copy().loc[:, cont_cols]
+        df_bin = df.copy().loc[:, bin_cols]
+    else:
+        if isinstance(exclude, list):
+            ex_cont_cols = [c for c in cont_cols if c not in exclude]
+            df_ex = df.copy().loc[:, exclude]
+            df_cont = df.copy().loc[:, ex_cont_cols]
+            df_bin = df.copy().loc[:, bin_cols]
+        else:
+            lst = []
+            lst.append(exclude)
+            ex_cont_cols = [c for c in cont_cols if c not in lst]
+            df_ex = df.copy().loc[:, lst]
+            df_cont = df.copy().loc[:, ex_cont_cols]
+            df_bin = df.copy().loc[:, bin_cols]
+        
+    # main loop for IQR
+    for col in df_cont.columns.tolist():
+        q1 = df_cont[col].quantile(low)
+        q3 = df_cont[col].quantile(high)
+        iqr = q3 - q1 
+        low_range  = q1 - factor * iqr
+        high_range = q3 + factor * iqr
+        df_cont[col].clip(lower=low_range, upper=high_range, inplace=True)
+        
+    if exclude == None:
+        return pd.concat([df_bin, df_cont], axis = 1)
+    else:
+        return pd.concat([df_bin, df_ex, df_cont], axis = 1)
+# -------------------------------------------------------------------------------------- 
+
+def _percentiles_clipper(df, low=0.05, high=0.95, exclude=None):
+    """
+    Function to clip continuous features based on [low, high] percentiles
+    ------------------------------
+    Parameters:
+              -df: Pandas DataFrame
+              -low: nth percentile as the low range (default=0.05)
+              -high: nth percentile as the high range (default=0.95)
+              -exclude: List of columns (i.e. ["col1", "col2", "col3"]) to be excluded from IQR clipping (default=None)
+    """
+    
+    # finding continouos/binary columns
+    bin_cols = _binary_col_finder(df)
+    cont_cols = _continuous_col_finder(df)
+
+    # checkpoint for any exclusion
+    if exclude == None:
+        df_cont = df.copy().loc[:, cont_cols]
+        df_bin = df.copy().loc[:, bin_cols]
+    else:
+        if isinstance(exclude, list):
+            ex_cont_cols = [c for c in cont_cols if c not in exclude]
+            df_ex = df.copy().loc[:, exclude]
+            df_cont = df.copy().loc[:, ex_cont_cols]
+            df_bin = df.copy().loc[:, bin_cols]
+        else:
+            lst = []
+            lst.append(exclude)
+            ex_cont_cols = [c for c in cont_cols if c not in lst]
+            df_ex = df.copy().loc[:, lst]
+            df_cont = df.copy().loc[:, ex_cont_cols]
+            df_bin = df.copy().loc[:, bin_cols]
+        
+    # main loop for [low, high] percentiles
+    df_quant = df_cont.quantile([low, high])
+    for col in df_cont.columns.tolist():
+        low_range = df_cont[col].quantile(low)
+        high_range = df_cont[col].quantile(high)
+        df_cont[col].clip(lower=low_range, upper=high_range, inplace=True)        
+        
+    if exclude == None:
+        return pd.concat([df_bin, df_cont], axis = 1)
+    else:
+        return pd.concat([df_bin, df_ex, df_cont], axis = 1)
+# --------------------------------------------------------------------------------------
+
+def _clipping_dict(df):
+    """
+    Function to return a dictionary of low/high range of clipping
+    Can be used after applying any clipping function including _iqr_clipper or _percentiles_clipper
+    """
+    cont_cols = _continuous_col_finder(df)
+    clipping_range = dict()
+    
+    df_min = df.loc[:, cont_cols].min()
+    df_max = df.loc[:, cont_cols].max()
+    for col in cont_cols:
+        clipping_range[col] = [df_min[col], df_max[col]]
+    
+    return clipping_range
+# --------------------------------------------------------------------------------------
+    
+def _join_dictionaries(dictionary1, dictionary2):
+    '''
+    Takes two dictionaries and combines values and keys into a single dictionary (outputed values may not be distinct,
+    if same key in both dictionaries have the same value).
+    
+    Required Parameter(s): dictionary1 (dictionary), dictionary2 (dictionary)
+    Optional Parameter(s): None
+    '''
+    dictionary={}
+    d1Keys = list(dictionary1.keys())
+    d2Keys = list(dictionary2.keys())
+    combinedKeys = list(set(d1Keys + d2Keys))
+
+ 
+
+    for key in combinedKeys:
+        d1_vals = []
+        d2_vals = []
+        if key in d1Keys:
+            d1_vals = dictionary1[key]
+            if isinstance(d1_vals, (int, float, str)):
+                d1_vals = [d1_vals]
+            
+        if key in d2Keys:
+            d2_vals = dictionary2[key]
+            if isinstance(d2_vals, (int, float, str)):
+                d2_vals = [d2_vals]
+        
+        dictionary[key] = list(set(d1_vals + d2_vals))
+    return dictionary
+# --------------------------------------------------------------------------------------
+def _slick_glmnet(X_, y, n_iter=2, alpha=0.1, n_splits=10, alpha_ini=0.0, penalty_gamma=2, seed=1367, scale_X=True):
+    """
+    Function to use adaptive glmnet for feature selection.
+    ---------------------------------
+    Parameters:
+               - X_ : features set which can be pandas dataframe and numpy array
+               - Y : target/response values
+               - n_iter: number of iterations (default=2)
+               - alpha : stability parameter, 0.0 for ridge and 1.0 for lasso (default = 0.1)
+               - n_splits : number of folds CV for finding penalty parameters lambda (default = 10)
+               - alpha_ini : (default = 0.0)
+               - penalty_gamma : gamma penalty value which can be lower for more features to keep (default = 2.0)
+               - seed: Random seed (default = 1367)
+               - scale_X: flag for scaling the feautures (default = True)
+              
+    """     
+    
+    
+    if scale_X == True:
+        # Defining the data + scaling
+        if isinstance(X_, pd.DataFrame):
+            X = pd.DataFrame(scale(X_), columns = X_.columns.tolist())
+        else:
+            X = scale(X_)
+    else:
+        X = X_
+    
+    for iteration in range(n_iter):
+        # update random state 
+        random_state = seed * iteration
+        X_permuted = _permute(df = X, random_state = random_state)
+        model = _A_glmnet(X_permuted, y, alpha=alpha, n_splits=n_splits, alpha_ini=alpha_ini, penalty_gamma=penalty_gamma, random_state=random_state, scale_X=scale_X)
+        df_coeff = _df_glmnet_coeff_path(model, X_permuted)
+        display(df_coeff)
+        pruned_features = [col for col in df_coeff.Features.values if "noisy" not in col]
+        print(F"Iteration {iteration+1}: {len(pruned_features)} Pruned Features Were Selected!")
+        X = X.loc[:, pruned_features]
+        del df_coeff, model, X_permuted
+        gc.collect()
+        
+    return pruned_features
